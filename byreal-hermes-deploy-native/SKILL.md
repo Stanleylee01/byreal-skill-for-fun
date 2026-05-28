@@ -1,14 +1,16 @@
 ---
 name: byreal-hermes-deploy-native
-version: 0.1.0
+version: 0.2.0
 description: "Deploy or sync the Hermes Telegram agent on top of RealClaw's built-in LLM API. Trigger on 'install hermes', 'deploy hermes', 'setup hermes', 'sync hermes', 'update hermes'."
 ---
 
 # Skill: Hermes Deploy (Native API)
 
-> Deploy Hermes on RealClaw's built-in LLM API. Only input is a new Telegram Bot Token.
+> Spawn a Hermes Telegram agent **on the same host as RealClaw**. Only input is a new Telegram Bot Token.
 >
-> **Depends on**: AGENTS.md §Skill Supply Chain Security (review gate for this skill; `HERMES_AGENT_REF` should be a reviewed commit SHA before production use), §Security Red Lines.
+> RealClaw is the parent runtime; Hermes is its Telegram-side child. This skill clones RealClaw's brain — every skill, the full memory store, AGENTS.md, TOOLS.md, USER.md, SOUL.md, wallet access — into a hermes-agent runtime under `~/.openclaw/hermes/`, then attaches it to a new TG bot. Boot it and it's RealClaw with a Telegram surface; the SOUL.md identity block tells Hermes who it is and that RealClaw spawned it.
+>
+> **Depends on**: AGENTS.md §Skill Updates & Config Safety (this skill is review-gated; `HERMES_AGENT_REF` must be a reviewed commit SHA before production), §Security Red Lines, §Wallet (address authority), §Secrets.
 
 ## References
 
@@ -22,34 +24,76 @@ description: "Deploy or sync the Hermes Telegram agent on top of RealClaw's buil
 
 ## Inputs
 
-One thing: a **new** Telegram Bot Token from @BotFather (`/newbot`). It must be a **different bot than the one RealClaw polls** — two pollers on the same bot break both. Tell the user this before asking.
+One thing: a **new** Telegram Bot Token from @BotFather (`/newbot`). It must be a **different bot than the one RealClaw polls** — two pollers on the same bot break both. Step 1 will hard-fail if the user accidentally pastes the same token.
 
 The LLM API config is read from `~/.openclaw/openclaw.json`. No other input needed.
+
+## What Hermes Inherits
+
+Default: **everything that makes RealClaw RealClaw.** Same host, same wallet, same brain.
+
+| File / dir | Copied? | Notes |
+|---|---|---|
+| `AGENTS.md`, `TOOLS.md`, `USER.md` | Yes | Same safety contract, tool routing, profile |
+| `SOUL.md` | Yes (with appended identity block) | Style reference + Hermes name; idempotent |
+| `MEMORY.md` | Yes | Long-term curated facts |
+| `memory/*.md` | Yes (full history) | Per-day daily logs — no time window |
+| `skills/*` | Yes (all but one) | Onboarding, tier-switch, watchdog, skill-review, every operational skill |
+| `BOOTSTRAP.md` | Yes if present | Almost always absent (auto-deletes after RealClaw onboards). If present, Hermes will see USER/SOUL already filled and skip onboarding. |
+| `skills/byreal-hermes-deploy-native` | **No** | Recursion guard — Hermes shouldn't deploy itself |
+| `BOOT.md` | **No** | CLI deps are global npm installs; Hermes doesn't run RealClaw's BOOT hook |
+| `hooks/` | **No** | OpenClaw runtime hooks (skill-updater) belong to the RealClaw runtime, not Hermes |
+| `configs/<strategy>/state.json` | **No** | Strategy state authority stays with RealClaw main session — see §Coexistence below |
+
+### Coexistence with RealClaw main session
+
+Both agents share the same wallet, AGENTS.md, and skills. The **only** state Hermes does NOT write is `configs/<strategy>/state.json` and the strategy crons that update it. Reason: two cron loops writing the same atomic state file race; whoever flushes second clobbers the other's snapshot. So:
+
+- Read-only access to `configs/` is fine — Hermes can answer "how is my LP doing" by reading state.
+- Hermes does not register strategy crons via `openclaw cron add`; main session owns the schedule.
+- This rule is enforced by the appended SOUL.md identity block, not by withholding files.
 
 ---
 
 ## Install Flow
 
-### Step 1: Verify openclaw.json is readable
+### Step 1: Verify openclaw.json + reject TG-token collision
 
-Do NOT re-type API keys. The agent masks/redacts sensitive values; config.yaml is written by Python in Step 4 so the key never passes through the agent or shell.
+Do NOT re-type API keys. The agent masks/redacts sensitive values; `config.yaml` is written by Python in Step 4 so the key never passes through the agent or shell.
 
-Must fail the flow on any missing field — silently continuing here leads to confusing errors in Step 4+.
+This block also fails if the user's TG token equals RealClaw's TG token (double polling = both bots break).
 
 ```bash
-python3 - << 'PYEOF' || { echo "ERROR: openclaw.json unreadable or missing fields — aborting."; exit 1; }
+: "${TG_TOKEN:?TG_TOKEN is unset — set it from the user input before running this block}"
+
+python3 - << 'PYEOF' || { echo "ERROR: openclaw.json unreadable / fields missing / TG-token collision — aborting."; exit 1; }
 import json, os
 with open(os.path.expanduser('~/.openclaw/openclaw.json')) as f:
     cfg = json.load(f)
-p = cfg['models']['providers']['anthropic']
+
+models = cfg.get('models', {})
+providers = models.get('providers', {})
+active = models.get('activeProvider') or models.get('default') or 'anthropic'
+p = providers.get(active) or providers.get('anthropic')
+if not p:
+    raise SystemExit(f"no usable provider in openclaw.json (active={active}, available={list(providers)})")
+
 required = ['baseUrl', 'apiKey']
 missing = [k for k in required if not p.get(k)]
 if missing: raise SystemExit(f"missing fields in openclaw.json: {missing}")
-if not p.get('models') or not p['models'][0].get('id'): raise SystemExit("no model id")
-print('base_url:', p['baseUrl'])
-print('api_mode:', p.get('api', 'anthropic-messages'))
-print('model:', p['models'][0]['id'])
-print('api_key:', p['apiKey'][:8] + '...')
+if not p.get('models') or not p['models'][0].get('id'):
+    raise SystemExit("no model id")
+
+rc_tg = (cfg.get('telegram') or {}).get('botToken') or os.environ.get('TELEGRAM_BOT_TOKEN', '')
+user_tg = os.environ.get('TG_TOKEN', '').strip()
+if rc_tg and user_tg and rc_tg.strip() == user_tg:
+    raise SystemExit("TG_TOKEN collides with RealClaw's bot token — create a NEW bot via @BotFather")
+
+print('provider :', active)
+print('base_url :', p['baseUrl'])
+print('api_mode :', p.get('api', 'anthropic-messages'))
+print('model    :', p['models'][0]['id'])
+print('api_key  :', p['apiKey'][:8] + '...')
 PYEOF
 ```
 
@@ -59,11 +103,6 @@ PYEOF
 export HERMES_HOME="$HOME/.openclaw/hermes"
 export PATH="$HERMES_HOME/bin:$PATH"
 
-grep -q 'HERMES_HOME=' "$HOME/.bashrc" 2>/dev/null || \
-  echo 'export HERMES_HOME="$HOME/.openclaw/hermes"' >> "$HOME/.bashrc"
-grep -q '.openclaw/hermes/bin' "$HOME/.bashrc" 2>/dev/null || \
-  echo 'export PATH="$HOME/.openclaw/hermes/bin:$PATH"' >> "$HOME/.bashrc"
-
 # python3-venv — fail loudly if we can't install it.
 if ! python3 -m venv --help >/dev/null 2>&1; then
   if [ "$(id -u)" = "0" ]; then apt-get install -y -qq python3-venv
@@ -72,11 +111,15 @@ if ! python3 -m venv --help >/dev/null 2>&1; then
   fi
 fi
 
-# uv — pinned version, verified against the release's .sha256 (no curl|sh).
-# Keep the GitHub asset filename intact so `sha256sum -c` can match what's inside the .sha256 file.
+# uv — pinned + checksum-verified.
 UV_VERSION="0.5.11"
-UV_TARGET="x86_64-unknown-linux-gnu"
+case "$(uname -m)" in
+  x86_64|amd64) UV_TARGET="x86_64-unknown-linux-gnu" ;;
+  aarch64|arm64) UV_TARGET="aarch64-unknown-linux-gnu" ;;
+  *) echo "ERROR: unsupported arch $(uname -m) for uv ${UV_VERSION}"; exit 1 ;;
+esac
 UV_ASSET="uv-${UV_TARGET}.tar.gz"
+
 if [ ! -x "$HERMES_HOME/bin/uv" ]; then
   mkdir -p "$HERMES_HOME/bin"
   T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
@@ -109,13 +152,11 @@ HERMES_AGENT_REF="main"  # TODO: pin to a reviewed commit SHA before production 
 HERMES_AGENT_REPO="https://github.com/NousResearch/hermes-agent.git"
 
 # Pin python-telegram-bot — supply-chain parity with uv and hermes-agent pins.
-# Bump after reviewing the release notes. v21 is the current LTS.
 PTB_VERSION="21.6"
 
 if [ ! -d "$HERMES_HOME/hermes-agent/.git" ]; then
   git clone "$HERMES_AGENT_REPO" "$HERMES_HOME/hermes-agent"
 fi
-# Always refresh to the configured ref so bumping HERMES_AGENT_REF takes effect on re-run.
 git -C "$HERMES_HOME/hermes-agent" fetch --quiet origin
 git -C "$HERMES_HOME/hermes-agent" checkout --detach --quiet "$HERMES_AGENT_REF"
 echo "hermes-agent at $(git -C "$HERMES_HOME/hermes-agent" rev-parse --short HEAD)"
@@ -130,19 +171,16 @@ uv pip install "python-telegram-bot==${PTB_VERSION}" --python venv/bin/python 2>
 
 ### Step 4: Write .env and config.yaml
 
-`.env` holds only the TG token. `config.yaml` is written by Python directly from `openclaw.json` so the API key never passes through the agent.
-
-The agent must export `TG_TOKEN` from the user's input before running this block. An unquoted heredoc then expands it, and the script aborts if the token is empty so we can't silently ship a broken `.env`.
+`.env` holds only the TG token. `config.yaml` is written by Python directly from `openclaw.json` so the API key never passes through the agent or shell.
 
 ```bash
 export HERMES_HOME="$HOME/.openclaw/hermes"
 
 : "${TG_TOKEN:?TG_TOKEN is unset — set it from the user input before running this block}"
-# Trim trailing whitespace / CR (pasted tokens often carry \r or spaces).
 TG_TOKEN="${TG_TOKEN%"${TG_TOKEN##*[![:space:]]}"}"
 TG_TOKEN="${TG_TOKEN#"${TG_TOKEN%%[![:space:]]*}"}"
 
-# Unlink first: POSIX `cat >` truncates but keeps the old mode. A prior run that
+# Unlink first: `cat >` truncates but keeps the old mode. A prior run that
 # created .env at 0644 would stay 0644 even inside an `umask 077` subshell.
 rm -f "$HERMES_HOME/.env"
 ( umask 077
@@ -158,21 +196,21 @@ import json, os
 home = os.path.expanduser("~/.openclaw/hermes")
 with open(os.path.expanduser("~/.openclaw/openclaw.json")) as f:
     cfg = json.load(f)
-p = cfg["models"]["providers"]["anthropic"]
+
+models = cfg.get("models", {})
+providers = models.get("providers", {})
+active = models.get("activeProvider") or models.get("default") or "anthropic"
+p = providers.get(active) or providers.get("anthropic")
 base_url = p["baseUrl"].rstrip("/").removesuffix("/v1")
 api_mode = p.get("api", "anthropic-messages").replace("-", "_")
 model_id = p["models"][0]["id"]
 
-# json.dumps yields a valid double-quoted YAML scalar for any string (handles :, #,
-# leading/trailing whitespace, etc). Don't interpolate raw values into YAML.
+# json.dumps yields a valid double-quoted YAML scalar for any string.
 def yq(s): return json.dumps(str(s))
 
 cfg_path = os.path.join(home, "config.yaml")
-# O_CREAT's mode arg is ignored if the file already exists → unlink first so a
-# pre-existing 0644 from an older install doesn't carry over.
 try: os.unlink(cfg_path)
 except FileNotFoundError: pass
-# Open with 0o600 from the start — no permission race window for the API key.
 body = f"""home_dir: ~/.openclaw/hermes
 
 model:
@@ -195,7 +233,7 @@ gateway:
 fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as f:
     f.write(body)
-print(f"config.yaml: model={model_id} base_url={base_url}")
+print(f"config.yaml: provider={active} model={model_id} base_url={base_url}")
 PYEOF
 ```
 
@@ -207,20 +245,23 @@ Config gotchas: strip trailing `/v1` from `base_url` (Hermes appends `/v1/messag
 export HERMES_HOME="$HOME/.openclaw/hermes"
 REALCLAW_WS="$HOME/.openclaw/workspace"
 
-for f in USER.md AGENTS.md TOOLS.md IDENTITY.md SOUL.md; do
+# Copy core docs. IDENTITY.md was removed in 0.2.x. BOOT.md / hooks/ stay in the
+# RealClaw workspace — Hermes is the agent runtime, not the OpenClaw runtime.
+# BOOTSTRAP.md is copied if it still exists (almost always already deleted).
+for f in USER.md AGENTS.md TOOLS.md SOUL.md MEMORY.md BOOTSTRAP.md; do
   cp "$REALCLAW_WS/$f" "$HERMES_HOME/$f" 2>/dev/null || true
 done
 
-# Last 7 days of memory.
+# Full memory history — Hermes shares context with RealClaw on the same host.
 if [ -d "$REALCLAW_WS/memory" ]; then
   mkdir -p "$HERMES_HOME/memory"
-  find "$REALCLAW_WS/memory" -name "*.md" -type f -mtime -7 -exec cp {} "$HERMES_HOME/memory/" \;
+  cp -r "$REALCLAW_WS/memory/." "$HERMES_HOME/memory/"
 fi
 
-# All skills except self-deploy and review gate. Reset first so re-runs don't
-# accumulate stale skills that were removed upstream. nullglob prevents the loop
-# from iterating over a literal "*/" when the skills dir is empty.
-EXCLUDED="byreal-hermes-deploy-native byreal-skill-review"
+# Skills: full inheritance. Only exclude self-deploy to avoid recursion (Hermes
+# deploying itself again). Onboarding / tier-switch / watchdog / skill-review all
+# travel with Hermes — co-execution rules live in the SOUL.md identity block.
+EXCLUDED="byreal-hermes-deploy-native"
 rm -rf "$HERMES_HOME/skills"
 mkdir -p "$HERMES_HOME/skills"
 if [ -d "$REALCLAW_WS/skills" ]; then
@@ -234,28 +275,34 @@ if [ -d "$REALCLAW_WS/skills" ]; then
 fi
 
 # Populate USER.md with real wallet addresses if missing/template.
-# Parses agent-token's JSON output — never regex-scrape base58 strings.
+# AGENTS.md §Wallet: agent-token wallet-info is the SOLE authoritative source.
+# Do NOT fall back to byreal-cli or any other tool.
 if [ ! -s "$HERMES_HOME/USER.md" ] || grep -qE '\{[a-z_]+\}' "$HERMES_HOME/USER.md" 2>/dev/null; then
   python3 << 'WALLETEOF'
 import subprocess, json, os
 home = os.path.expanduser("~/.openclaw/hermes")
 wallets = {}
-LABELS = {"solana": "Solana", "mantle": "EVM (Mantle)",
-          "ethereum": "EVM (Ethereum)", "base": "EVM (Base)"}
+LABELS = {"solana": "Solana", "ethereum": "EVM (Mantle)"}  # TOOLS.md Chain Reference
 
 def add(chain, addr):
     l = LABELS.get(str(chain).lower())
     if l and addr and l not in wallets: wallets[l] = addr
 
-for p in ["~/.openclaw/skills/agent-token/scripts/agent-token.ts",
-          "~/.openclaw/hermes/skills/agent-token/scripts/agent-token.ts",
-          "~/.openclaw/workspace/skills/agent-token/scripts/agent-token.ts"]:
+# Workspace path is canonical (BOOT.md §4); fall back only to Hermes's own copy.
+candidates = [
+    "~/.openclaw/workspace/skills/agent-token/scripts/agent-token.ts",
+    "~/.openclaw/hermes/skills/agent-token/scripts/agent-token.ts",
+]
+
+for p in candidates:
     script = os.path.expanduser(p)
     if not os.path.exists(script): continue
     try:
-        r = subprocess.run(["bun", script, "wallet-info", "--json"],
-                           capture_output=True, text=True, timeout=15,
-                           env={**os.environ, "CLAUDE_SKILL_DIR": os.path.dirname(os.path.dirname(script))})
+        r = subprocess.run(
+            ["bun", script, "wallet-info", "--json"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, "CLAUDE_SKILL_DIR": os.path.dirname(os.path.dirname(script))},
+        )
         data = json.loads(r.stdout)
     except Exception:
         continue
@@ -267,30 +314,22 @@ for p in ["~/.openclaw/skills/agent-token/scripts/agent-token.ts",
             if isinstance(v, str): add(k, v)
     if wallets: break
 
-if "Solana" not in wallets:
-    try:
-        r = subprocess.run(["byreal-cli", "wallet", "address"], capture_output=True, text=True, timeout=10)
-        a = (r.stdout or "").strip()
-        if r.returncode == 0 and 32 <= len(a) <= 44 and not a.startswith("0x"):
-            wallets["Solana"] = a
-    except Exception: pass
-
 if wallets:
     md = "# User Profile\n\n## Wallets (RealClaw Privy)\n\n| Network | Address |\n|---------|---------|\n"
     md += "".join(f"| {n} | {a} |\n" for n, a in wallets.items())
     md += "\n*RealClaw Privy server-side wallets — Hermes uses these for on-chain ops.*\n"
+    md += "*Display rule (AGENTS.md §Wallet): always truncate addresses in chat; full copy via Console.*\n"
     open(os.path.join(home, "USER.md"), "w").write(md)
     print(f"USER.md: {len(wallets)} wallet(s) — {', '.join(wallets)}")
 else:
     open(os.path.join(home, "USER.md"), "w").write(
-        "# User Profile\n\nWallet addresses not configured. Ask the user.\n")
-    print("WARNING: no wallets detected — Hermes will ask on first message")
+        "# User Profile\n\nWallet addresses unavailable (agent-token wallet-info failed). "
+        "Hermes will refuse on-chain ops until this is fixed; do NOT infer addresses by reasoning.\n")
+    print("WARNING: agent-token wallet-info failed — Hermes will refuse on-chain ops")
 WALLETEOF
 fi
 
 # Warn on empty/placeholder core files (not auto-fixed).
-# TOOLS.md matters for Hermes to know chain addresses; without it, skills that
-# reference token mints or program IDs will fail.
 for f in SOUL.md AGENTS.md TOOLS.md; do
   if [ ! -s "$HERMES_HOME/$f" ] || grep -q "^placeholder$" "$HERMES_HOME/$f" 2>/dev/null; then
     echo "WARNING: $f empty/placeholder — run byreal-onboarding on RealClaw, then 'sync hermes'"
@@ -300,7 +339,7 @@ done
 
 ### Step 6: Inject Hermes identity into SOUL.md
 
-Hermes reads only SOUL.md (not SYSTEM_PROMPT_INJECT.md), so the identity block is appended to SOUL.md by the shared script. Idempotent — skipped if the marker is already present.
+Hermes reads only SOUL.md (not BOOTSTRAP.md), so the identity block is appended to SOUL.md by the shared script. Idempotent — skipped if the marker is already present.
 
 ```bash
 export HERMES_HOME="$HOME/.openclaw/hermes"
@@ -332,7 +371,6 @@ exec "$HERMES_HOME/hermes-agent/venv/bin/python3" -m hermes_cli.main gateway >> 
 SCRIPTEOF
 chmod +x "$HERMES_HOME/start.sh"
 
-# nohup + disown so the gateway survives the parent shell (container restart, SSH disconnect).
 nohup bash "$HERMES_HOME/start.sh" >/dev/null 2>&1 & disown
 sleep 6
 tail -15 "$HERMES_HOME/logs/gateway.log"
@@ -344,24 +382,26 @@ tail -15 "$HERMES_HOME/logs/gateway.log"
 |---|---|
 | `Connected to Telegram` + `Gateway running` | success |
 | HTTP 404 | `base_url` still ends in `/v1` — strip and restart |
-| HTTP 401 | API key rotated — re-read `openclaw.json` and update `config.yaml` |
-| Connection refused | proxy IP changed — re-read `openclaw.json` |
+| HTTP 401 (LLM) | API key rotated — run `sync hermes` to refresh `config.yaml` |
+| HTTP 401 (aux service) | Expected — Hermes has no RealClaw session cookie. Use public APIs instead (CoinGecko / Jupiter / DexScreener) |
+| Connection refused | proxy IP changed — run `sync hermes` |
+| TG `Conflict: terminated by other getUpdates` | Two pollers on the same bot — confirm Hermes uses a different bot than RealClaw |
 | PID/lock error | `rm -f $HERMES_HOME/gateway.pid $HERMES_HOME/gateway_state.json` and retry |
 
 ### Post-deploy message to user
 
 - Running on RealClaw's built-in API — no external API costs.
-- Model: `<from config.yaml>`. Full knowledge shared: profile, wallets, safety rules, memory, all skills.
+- Model: `<from config.yaml>`. Knowledge shared: profile, wallets, safety rules, recent memory, operational skills.
 - Test: message the new bot on Telegram.
 - After RealClaw restart: `nohup bash ~/.openclaw/hermes/start.sh >/dev/null 2>&1 & disown`
-- To update knowledge: say "sync hermes".
+- To refresh after RealClaw learns something / proxy rotates: say "sync hermes".
 - Logs: `tail -f ~/.openclaw/hermes/logs/gateway.log`
 
 ---
 
 ## Sync Flow
 
-Re-copies core files + memory + skills, re-injects the SOUL identity block, and restarts Hermes.
+Re-copies core files + memory + skills, **rewrites `config.yaml` from `openclaw.json`** (proxy IP / model / key may have rotated), re-injects the SOUL identity block, and restarts Hermes.
 
 ```bash
 export HERMES_HOME="$HOME/.openclaw/hermes"
@@ -377,7 +417,8 @@ is_placeholder() {
   [ ! -s "$1" ] || grep -q "^placeholder$" "$1" 2>/dev/null
 }
 
-for f in USER.md AGENTS.md TOOLS.md IDENTITY.md; do
+# 1. Refresh core docs (BOOT.md / hooks/ excluded by design — see install Step 5).
+for f in USER.md AGENTS.md TOOLS.md MEMORY.md; do
   if [ -f "$REALCLAW_WS/$f" ] && ! is_placeholder "$REALCLAW_WS/$f"; then
     cp "$REALCLAW_WS/$f" "$HERMES_HOME/$f"
   fi
@@ -388,13 +429,16 @@ if [ -f "$REALCLAW_WS/SOUL.md" ] && ! is_placeholder "$REALCLAW_WS/SOUL.md"; the
   bash "${CLAUDE_SKILL_DIR:-$HOME/.openclaw/workspace/skills/byreal-hermes-deploy-native}/references/soul-inject.sh"
 fi
 
+# 2. Full memory history (sync is authoritative — old per-day files removed upstream
+#    are not auto-deleted in Hermes; rsync --delete would do it but we keep cp for
+#    portability and let stale daily logs decay naturally).
 if [ -d "$REALCLAW_WS/memory" ]; then
   mkdir -p "$HERMES_HOME/memory"
-  find "$REALCLAW_WS/memory" -name "*.md" -type f -mtime -7 -exec cp {} "$HERMES_HOME/memory/" \;
+  cp -r "$REALCLAW_WS/memory/." "$HERMES_HOME/memory/"
 fi
 
-# Reset skills/ before copying so upstream removals propagate (sync is authoritative).
-EXCLUDED="byreal-hermes-deploy-native byreal-skill-review"
+# 3. Skills: same single exclusion as install (recursion guard only).
+EXCLUDED="byreal-hermes-deploy-native"
 rm -rf "$HERMES_HOME/skills"
 mkdir -p "$HERMES_HOME/skills"
 if [ -d "$REALCLAW_WS/skills" ]; then
@@ -407,7 +451,50 @@ if [ -d "$REALCLAW_WS/skills" ]; then
   shopt -u nullglob
 fi
 
-# Wait for the old gateway to exit before restarting so port 8765 is free.
+# 4. Rewrite config.yaml — proxy IP / model / key may have rotated since install.
+python3 << 'PYEOF'
+import json, os
+home = os.path.expanduser("~/.openclaw/hermes")
+with open(os.path.expanduser("~/.openclaw/openclaw.json")) as f:
+    cfg = json.load(f)
+models = cfg.get("models", {})
+providers = models.get("providers", {})
+active = models.get("activeProvider") or models.get("default") or "anthropic"
+p = providers.get(active) or providers.get("anthropic")
+base_url = p["baseUrl"].rstrip("/").removesuffix("/v1")
+api_mode = p.get("api", "anthropic-messages").replace("-", "_")
+model_id = p["models"][0]["id"]
+def yq(s): return json.dumps(str(s))
+
+cfg_path = os.path.join(home, "config.yaml")
+try: os.unlink(cfg_path)
+except FileNotFoundError: pass
+body = f"""home_dir: ~/.openclaw/hermes
+
+model:
+  default: {yq(model_id)}
+  provider: realclaw
+
+agent:
+  reasoning_effort: ''
+
+custom_providers:
+  - name: realclaw
+    base_url: {yq(base_url)}
+    api_key: {yq(p["apiKey"])}
+    api_mode: {yq(api_mode)}
+
+gateway:
+  host: 0.0.0.0
+  port: 8765
+"""
+fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(body)
+print(f"config.yaml refreshed: provider={active} model={model_id} base_url={base_url}")
+PYEOF
+
+# 5. Restart gateway.
 pkill -f "hermes_cli.main" 2>/dev/null || true
 for i in $(seq 1 10); do
   pgrep -f "hermes_cli.main" >/dev/null 2>&1 || break
