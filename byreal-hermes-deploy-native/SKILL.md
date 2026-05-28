@@ -1,6 +1,6 @@
 ---
 name: byreal-hermes-deploy-native
-version: 0.2.1
+version: 0.2.2
 description: "Deploy or sync the Hermes Telegram agent on top of RealClaw's built-in LLM API. Trigger on 'install hermes', 'deploy hermes', 'setup hermes', 'sync hermes', 'update hermes'."
 ---
 
@@ -38,7 +38,7 @@ Default: **everything that makes RealClaw RealClaw.** Same host, same wallet, sa
 | `SOUL.md` | Yes (with appended identity block) | Style reference + Hermes name; idempotent |
 | `MEMORY.md` | Yes | Long-term curated facts |
 | `memory/*.md` | Yes (full history) | Per-day daily logs — no time window |
-| `skills/*` | Yes (all but one) | Onboarding, tier-switch, watchdog, skill-review, every operational skill |
+| `skills/*` | Yes (all but one) | Union of `~/.openclaw/workspace/skills/` (curated) and `~/.openclaw/skills/` (global pre-install — `agent-token` etc.). Workspace wins on name collision. |
 | `BOOTSTRAP.md` | Yes if present | Almost always absent (auto-deletes after RealClaw onboards). If present, Hermes will see USER/SOUL already filled and skip onboarding. |
 | `skills/byreal-hermes-deploy-native` | **No** | Recursion guard — Hermes shouldn't deploy itself |
 | `BOOT.md` | **No** | CLI deps are global npm installs; Hermes doesn't run RealClaw's BOOT hook |
@@ -261,18 +261,33 @@ fi
 # Skills: full inheritance. Only exclude self-deploy to avoid recursion (Hermes
 # deploying itself again). Onboarding / tier-switch / watchdog / skill-review all
 # travel with Hermes — co-execution rules live in the SOUL.md identity block.
+#
+# Two source dirs to walk: the workspace skills repo and the global pre-install
+# dir (~/.openclaw/skills/). RealClaw ships some skills (notably agent-token) at
+# the global path, others under workspace; Hermes needs the union. Workspace
+# wins on collisions because that's what skill-updater curates.
 EXCLUDED="byreal-hermes-deploy-native"
+GLOBAL_SKILLS_DIR="$HOME/.openclaw/skills"
 rm -rf "$HERMES_HOME/skills"
 mkdir -p "$HERMES_HOME/skills"
-if [ -d "$REALCLAW_WS/skills" ]; then
+
+copy_skills_from() {
+  local src="$1"
+  [ -d "$src" ] || return 0
   shopt -s nullglob
-  for d in "$REALCLAW_WS/skills"/*/; do
-    name=$(basename "$d"); skip=false
+  for d in "$src"/*/; do
+    name=$(basename "$d")
+    skip=false
     for ex in $EXCLUDED; do [ "$name" = "$ex" ] && skip=true; done
-    [ "$skip" = false ] && cp -r "$d" "$HERMES_HOME/skills/"
+    [ "$skip" = false ] && [ ! -d "$HERMES_HOME/skills/$name" ] && cp -r "$d" "$HERMES_HOME/skills/"
   done
   shopt -u nullglob
-fi
+}
+
+# Workspace first (curated, skill-updater authoritative), then global (filling
+# in agent-token and friends that ship pre-installed).
+copy_skills_from "$REALCLAW_WS/skills"
+copy_skills_from "$GLOBAL_SKILLS_DIR"
 
 # Populate USER.md with real wallet addresses if missing/template.
 # AGENTS.md §Wallet: agent-token wallet-info is the SOLE authoritative source.
@@ -288,8 +303,12 @@ def add(chain, addr):
     l = LABELS.get(str(chain).lower())
     if l and addr and l not in wallets: wallets[l] = addr
 
-# Workspace path is canonical (BOOT.md §4); fall back only to Hermes's own copy.
+# RealClaw ships agent-token in two possible locations depending on pod build:
+#   1. ~/.openclaw/skills/        — global pre-install (production default)
+#   2. ~/.openclaw/workspace/skills/ — workspace-managed (BOOT.md §4 fallback)
+#   3. ~/.openclaw/hermes/skills/  — already-mirrored copy from this skill
 candidates = [
+    "~/.openclaw/skills/agent-token/scripts/agent-token.ts",
     "~/.openclaw/workspace/skills/agent-token/scripts/agent-token.ts",
     "~/.openclaw/hermes/skills/agent-token/scripts/agent-token.ts",
 ]
@@ -437,19 +456,27 @@ if [ -d "$REALCLAW_WS/memory" ]; then
   cp -r "$REALCLAW_WS/memory/." "$HERMES_HOME/memory/"
 fi
 
-# 3. Skills: same single exclusion as install (recursion guard only).
+# 3. Skills: workspace + global pre-install dirs unioned (same as install).
 EXCLUDED="byreal-hermes-deploy-native"
+GLOBAL_SKILLS_DIR="$HOME/.openclaw/skills"
 rm -rf "$HERMES_HOME/skills"
 mkdir -p "$HERMES_HOME/skills"
-if [ -d "$REALCLAW_WS/skills" ]; then
+
+copy_skills_from() {
+  local src="$1"
+  [ -d "$src" ] || return 0
   shopt -s nullglob
-  for d in "$REALCLAW_WS/skills"/*/; do
-    name=$(basename "$d"); skip=false
+  for d in "$src"/*/; do
+    name=$(basename "$d")
+    skip=false
     for ex in $EXCLUDED; do [ "$name" = "$ex" ] && skip=true; done
-    [ "$skip" = false ] && cp -r "$d" "$HERMES_HOME/skills/"
+    [ "$skip" = false ] && [ ! -d "$HERMES_HOME/skills/$name" ] && cp -r "$d" "$HERMES_HOME/skills/"
   done
   shopt -u nullglob
-fi
+}
+
+copy_skills_from "$REALCLAW_WS/skills"
+copy_skills_from "$GLOBAL_SKILLS_DIR"
 
 # 4. Rewrite config.yaml — proxy IP / model / key may have rotated since install.
 python3 << 'PYEOF'
