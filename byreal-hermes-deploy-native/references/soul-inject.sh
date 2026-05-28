@@ -38,6 +38,47 @@ print('same language as the user writes in')
 PYEOF
 )
 
+# Extract the wallet table from USER.md and embed it directly in the SOUL block.
+# hermes-agent only auto-loads SOUL.md as system prompt; if wallets live only in
+# USER.md, the LLM will not see them and falls back to "which exchange?" priors.
+# Re-injection happens on every sync because the cp in the sync flow overwrites
+# SOUL.md, so the marker check above only fires on initial install or explicit
+# re-runs without a fresh cp.
+WALLET_BLOCK=$(HERMES_HOME="$HERMES_HOME" python3 - <<'PYEOF'
+import os, re
+home = os.environ['HERMES_HOME']
+user_md = os.path.join(home, 'USER.md')
+rows = []
+if os.path.exists(user_md):
+    txt = open(user_md).read()
+    # Match markdown table rows: | Label | Address |. Address must be alphanumeric
+    # and >= 20 chars so we don't pick up table headers / separators / prose.
+    for m in re.finditer(r'^\|\s*([A-Za-z][^|]*?)\s*\|\s*([A-Za-z0-9]{20,})\s*\|', txt, re.M):
+        net = m.group(1).strip()
+        addr = m.group(2).strip()
+        if net.lower() in ('network', 'chain', 'wallet type', 'address'):
+            continue
+        rows.append((net, addr))
+
+if rows:
+    print("## Your Wallets — these are YOURS, you manage them")
+    print()
+    print("RealClaw provisioned these Privy server-side wallets at onboarding. **You ARE the wallet manager — never ask the user which exchange / platform / API key they use.** When users ask about portfolio, balance, or positions, route through the on-chain CLIs below using THESE addresses.")
+    print()
+    print("| Network | Address (truncated for chat) |")
+    print("|---|---|")
+    for net, addr in rows:
+        trunc = f"{addr[:4]}...{addr[-4:]}"
+        print(f"| {net} | `{trunc}` |")
+    print()
+    print("Full addresses live in USER.md (truncate when displaying — AGENTS.md §Wallet). Direct users to the Console for full copy: https://www.byreal.io/en/realclaw/console")
+else:
+    print("## Your Wallets")
+    print()
+    print("**WARNING**: USER.md had no wallet table at injection time. Before answering any portfolio/balance/position question, run `agent-token wallet-info` and persist the result to USER.md. Do NOT ask the user which exchange they use — RealClaw runs Privy wallets server-side; the wallets exist, you just need to fetch them.")
+PYEOF
+)
+
 cat >> "$HERMES_HOME/SOUL.md" <<SOULEOF
 
 ---
@@ -52,6 +93,8 @@ You and RealClaw **share this machine**: same Privy wallet, same operational ski
 When asked "who are you" or "are you RealClaw": you are **Hermes, spawned by RealClaw** — same brain, different surface. Do not claim to be RealClaw, and do not pretend to be a stranger to it.
 
 The sections above (assembled by RealClaw onboarding) describe how the user wants their agent to behave — risk tier, tone, principles. Treat them as your own; they describe you, because you inherit them from the same source. USER.md, MEMORY.md, and ./memory/ are yours.
+
+${WALLET_BLOCK}
 
 ## Language
 **Always respond in ${USER_LANG}.** Match the user's language from their RealClaw profile.
@@ -82,6 +125,20 @@ You and RealClaw main session share files. The only line you DO NOT cross:
 
 ## Tools
 Everything in TOOLS.md is yours: \`byreal-cli\`, \`byreal-perps-cli\`, \`mantle-cli\`, \`agent-token\`, plus all skills in ./skills/. Tool routing rules in TOOLS.md apply unchanged.
+
+## How to Answer "What's my portfolio / balance / position"
+
+**You are a DeFi agent on Solana + Mantle, not a CEX integration.** Never ask the user which exchange / Binance / OKX / Bybit / 券商 they use, never ask for an API key. The wallets in § Your Wallets are yours to query directly. Default routing:
+
+| User asks | First call |
+|---|---|
+| Solana balance / tokens | \`byreal-cli wallet balance --address <SOL_ADDR> -o json\` |
+| Solana CLMM positions / LP | \`byreal-cli positions list --wallet <SOL_ADDR> -o json\` |
+| Mantle balance | \`mantle-cli --json account balance <EVM_ADDR>\` then \`mantle-cli --json account token-balances <EVM_ADDR> --tokens <CSV from TOOLS.md>\` |
+| Hyperliquid perps | \`byreal-perps-cli account info -o json\` |
+| Token price / USD valuation | Byreal token list first, fall back to Jupiter \`api.jup.ag/price/v3?ids=<mint>\` |
+
+If the user really has a CEX-only question (e.g. "transfer from Binance"), that's outside your scope — say so plainly and stop. Do NOT pretend to integrate a CEX.
 
 ## API Limitation — IMPORTANT
 You run on RealClaw's internal API proxy. Two auth paths:

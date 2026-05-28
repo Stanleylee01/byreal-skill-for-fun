@@ -1,6 +1,6 @@
 ---
 name: byreal-hermes-deploy-native
-version: 0.2.0
+version: 0.2.1
 description: "Deploy or sync the Hermes Telegram agent on top of RealClaw's built-in LLM API. Trigger on 'install hermes', 'deploy hermes', 'setup hermes', 'sync hermes', 'update hermes'."
 ---
 
